@@ -1,0 +1,16 @@
+version: 0.2
+# 把公网镜像 (Docker Hub 等, ECR Pull-through Cache 无凭证时拉不了的) 中转到私有 ECR 的 mirror/ 前缀下。
+# 需要环境变量: ECR_REGISTRY, SRC_IMAGE (如 grafana/grafana:12.0.0), DST_REPO (如 mirror/grafana/grafana), DST_TAG
+# 目标 ECR 仓库需提前创建。镜像按 PLATFORM (默认 linux/arm64; x86 用 linux/amd64, 并建议用不同的 DST_TAG) 拉取。
+phases:
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+  build:
+    commands:
+      - for i in 1 2 3 4 5; do docker pull --platform "${PLATFORM:-linux/arm64}" "$SRC_IMAGE" && break; echo "pull retry $i"; sleep 30; done
+      - docker tag "$SRC_IMAGE" "$ECR_REGISTRY/$DST_REPO:$DST_TAG"
+  post_build:
+    commands:
+      - docker push "$ECR_REGISTRY/$DST_REPO:$DST_TAG"
+      - echo "mirrored $SRC_IMAGE -> $ECR_REGISTRY/$DST_REPO:$DST_TAG"

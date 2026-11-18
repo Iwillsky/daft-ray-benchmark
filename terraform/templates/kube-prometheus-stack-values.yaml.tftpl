@@ -1,0 +1,87 @@
+# kube-prometheus-stack: 只作为"采集器", 数据 remote write 到 Amazon Managed Prometheus (AMP)。
+# Grafana 用 Amazon Managed Grafana (AMG), 所以这里关掉自带的 Grafana 和 Alertmanager。
+#
+# 用法 (envsubst 填 AMP_WORKSPACE_ID):
+#   export AMP_WORKSPACE_ID=ws-xxxxxxxx
+#   envsubst < monitoring/kube-prometheus-stack-values.yaml | \
+#     helm upgrade --install kps prometheus-community/kube-prometheus-stack \
+#       -n monitoring -f - --wait
+#
+# 前置: cluster.yaml 已通过 eksctl 创建 ServiceAccount monitoring/amp-prometheus (IRSA, AmazonPrometheusRemoteWriteAccess)。
+
+grafana:
+  enabled: false
+alertmanager:
+  enabled: false
+defaultRules:
+  create: false                 # AMP 上按需再建告警规则; 先不送默认规则, 减少无用序列
+
+# EKS 托管控制面的这几个组件抓不到, 关掉避免 target 报错
+kubeEtcd:              { enabled: false }
+kubeControllerManager: { enabled: false }
+kubeScheduler:         { enabled: false }
+kubeProxy:             { enabled: false }
+
+prometheus:
+  # 新版 chart 的 kubelet 等 ServiceMonitor 需要 chart 自己创建的 token Secret, 它只在 chart 创建 ServiceAccount 时才渲染,
+  # 所以让 chart 建 SA (名字沿用 amp-prometheus), 通过注解绑定 eksctl 建好的 IRSA 角色。
+  # 先 `kubectl -n monitoring delete sa amp-prometheus` (只删 SA, IAM 角色保留), 再装 chart。
+  serviceAccount:
+    create: true
+    name: amp-prometheus
+    annotations:
+      eks.amazonaws.com/role-arn: ${AMP_ROLE_ARN}
+  prometheusSpec:
+    retention: 2h                 # 本地只留 2 小时, 长期数据在 AMP
+    # 默认只选带 helm release 标签的 ServiceMonitor/PodMonitor; 置 false 以选中 ray 命名空间里的 PodMonitor
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    nodeSelector:
+      role: system                # 跑在 m8g 系统节点
+    image:
+      registry: ${ECR_REGISTRY}
+      repository: quay/prometheus/prometheus
+    resources:
+      requests: { cpu: "1", memory: 4Gi }
+      limits:   { memory: 4Gi }
+    externalLabels:
+      cluster: ${CLUSTER_NAME}
+    remoteWrite:
+      - url: https://aps-workspaces.us-west-2.amazonaws.com/workspaces/${AMP_WORKSPACE_ID}/api/v1/remote_write
+        sigv4:
+          region: us-west-2
+        queueConfig:
+          maxSamplesPerSend: 1000
+          maxShards: 200
+          capacity: 2500
+
+# ── 镜像走 ECR Pull-through Cache (节点访问不了 quay.io / registry.k8s.io) ──
+# ${ECR_REGISTRY} 例如 <账号ID>.dkr.ecr.<region>.amazonaws.com; 前缀 quay / k8s 对应缓存规则。
+kube-state-metrics:
+  nodeSelector:
+    role: system
+  image:
+    registry: ${ECR_REGISTRY}
+    repository: k8s/kube-state-metrics/kube-state-metrics
+prometheus-node-exporter:
+  image:
+    registry: ${ECR_REGISTRY}
+    repository: quay/prometheus/node-exporter
+  # r8gd 节点有 taint workload=ray-worker:NoSchedule, node-exporter 要容忍才能采到 worker 节点的 CPU/内存/NVMe 指标
+  tolerations:
+    - operator: Exists
+prometheusOperator:
+  nodeSelector:
+    role: system
+  image:
+    registry: ${ECR_REGISTRY}
+    repository: quay/prometheus-operator/prometheus-operator
+  prometheusConfigReloader:
+    image:
+      registry: ${ECR_REGISTRY}
+      repository: quay/prometheus-operator/prometheus-config-reloader
+  # 关闭 admission webhook 与其 certgen Job (其镜像在 ghcr.io, 没有无凭证的缓存规则), 个人使用场景不需要
+  admissionWebhooks:
+    enabled: false
+  tls:
+    enabled: false

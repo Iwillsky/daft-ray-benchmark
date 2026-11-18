@@ -1,0 +1,22 @@
+# 让 Prometheus 抓取 Ray head / worker 的 metrics (每个 Ray 进程在 :8080 暴露, 名为 "metrics" 的容器端口)。
+# 依赖 kube-prometheus-stack 提供的 PodMonitor CRD, 先装 monitoring 栈再 apply。
+# KubeRay 会给 Ray pod 打 ray.io/node-type=head|worker 标签。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ray-nodes
+  namespace: ray
+spec:
+  namespaceSelector:
+    matchNames: ["ray"]
+  selector:
+    matchExpressions:
+      - { key: ray.io/node-type, operator: In, values: ["head", "worker"] }
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+  podTargetLabels:
+    - ray.io/cluster
+    - ray.io/node-type
+    - ray.io/group

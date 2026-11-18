@@ -1,0 +1,6 @@
+# 复制为 terraform.tfvars 后按需修改。只有 worker_instance_type 是必改项, 其余默认值 = 测试一的三节点配置。
+worker_instance_type = "r8g.4xlarge"   # r7i / r8i / r8a / r8g / r9g .4xlarge, 或带 NVMe 的 r8gd / r8id / r9gd .4xlarge
+aws_profile         = "my-aws-profile"       # 不用 profile 时删除这一行
+# name              = "daft-ray-static"
+# worker_count      = 3
+# object_store_bytes = 80000000000       # Q22x3 / SF1000 用 80 GB; 默认 64 GiB

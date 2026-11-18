@@ -1,0 +1,19 @@
+version: 0.2
+# 用 DuckDB 在 S3 上的 TPC-H Parquet 数据集 (SF$SF) 上独立计算 Q1-Q22 的参考结果, 写到输出桶 tpch-v2/reference/sf$SF/q<N>.json
+# DuckDB 固定 1.5.6 (与 SF100/SF1000 参考结果同版本; 2.0.0 在 SF300 的 Q21 上报 INTERNAL Error)
+# 对应 job/tpch_reference.py --local; 环境变量: SF, THREADS, MEM_GB (2XLARGE ARM: THREADS=32 MEM_GB=60)
+# DuckDB 偶尔被容器 OOM 杀掉 (退出码 137, 例如 Q13/Q18), 所以最多重跑 8 次, 每次跳过已经算好的题。
+phases:
+  install:
+    commands:
+      - python3 -m pip install --quiet duckdb==1.5.6 boto3
+      - python3 -c "import duckdb; duckdb.connect().execute('INSTALL httpfs')"
+  build:
+    commands:
+      - |
+        ok=0
+        for i in 1 2 3 4 5 6 7 8; do
+          if python3 job/tpch_reference.py --local --skip-existing --sf $SF --threads $THREADS --mem-gb $MEM_GB --temp-dir /tmp/duckdb_tmp; then ok=1; break; fi
+          echo "attempt $i failed, retry"; rm -rf /tmp/duckdb_tmp
+        done
+        [ "$ok" = 1 ]

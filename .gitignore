@@ -1,0 +1,15 @@
+# 本地配置与运行状态
+config.env
+.install/
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/crash.log
+
+# Python / 系统
+__pycache__/
+*.pyc
+.DS_Store

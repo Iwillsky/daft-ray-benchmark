@@ -1,0 +1,15 @@
+version: 0.2
+# 生成 TPC-H Parquet 数据集 (对齐 Daft 官方 benchmark 的布局/类型), 见 codebuild/tpch_gen.py 顶部说明。
+# 在 CodeBuild 里做是因为 DuckDB 扩展需要联网下载, 集群节点访问不了公网。
+#
+# 环境变量: SF, CHILDREN, PROCS, DATA_BUCKET, (可选) DATA_ROOT
+#   SF1    : CHILDREN=8   PROCS=4
+#   SF100  : CHILDREN=32  PROCS=8
+#   SF1000 : CHILDREN=512 PROCS=12   (建议 --compute-type-override BUILD_GENERAL1_XLARGE, --timeout-in-minutes-override 480)
+phases:
+  install:
+    commands:
+      - python3 -m pip install --quiet duckdb
+  build:
+    commands:
+      - python3 codebuild/tpch_gen.py

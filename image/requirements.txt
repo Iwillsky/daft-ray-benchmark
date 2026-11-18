@@ -1,0 +1,12 @@
+# 全部需有 aarch64 manylinux wheel。Ray 由基础镜像提供 (2.59.0), 不在此安装。
+# Daft 0.7.26 (PyPI 包名为 daft, 旧名 getdaft 已停更); aws extra 带 boto3 (<1.44)。
+# 不装 `ray` extra: 会重复拉 ray[client,data], 而 Ray 已在基础镜像里。
+daft[aws]==0.7.26
+pyarrow>=16,<26      # Daft 0.7.26 要求 pyarrow<26
+numpy<2.4
+
+# tpch_reference.py 用 DuckDB 在 worker 上独立计算 TPC-H 参考结果 (Dockerfile 里预装 httpfs 扩展, 节点离线可用)
+duckdb==1.5.6
+
+# TPC-H 数据生成 / 校验 (按需启用)
+# duckdb               # 用 duckdb 的 tpch 扩展生成 parquet 数据, 并校验结果

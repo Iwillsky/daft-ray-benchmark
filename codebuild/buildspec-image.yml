@@ -1,0 +1,18 @@
+version: 0.2
+# 在 CodeBuild (与目标架构相同的原生构建环境) 里构建 Ray+Daft 镜像并推到 ECR。
+# 需要环境变量: ECR_REGISTRY (例如 <账号ID>.dkr.ecr.<region>.amazonaws.com), IMAGE_URI, BASE_IMAGE
+# 可选: EXPECT_ARCH (aarch64 默认 / x86_64), 要和构建环境架构一致
+phases:
+  pre_build:
+    commands:
+      - uname -m
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+  build:
+    commands:
+      # Docker Hub 匿名拉取可能被限流, 失败重试几次
+      - for i in 1 2 3 4 5; do docker pull "$BASE_IMAGE" && break; echo "pull retry $i"; sleep 30; done
+      - docker build --build-arg BASE_IMAGE="$BASE_IMAGE" --build-arg EXPECT_ARCH="${EXPECT_ARCH:-aarch64}" -t "$IMAGE_URI" .
+  post_build:
+    commands:
+      - docker push "$IMAGE_URI"
+      - echo "pushed $IMAGE_URI"

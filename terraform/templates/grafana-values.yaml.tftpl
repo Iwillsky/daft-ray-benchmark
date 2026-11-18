@@ -1,0 +1,66 @@
+# 自建 Grafana (AMG 在本账号无法登录: 账号属于 Organization, 且只有成员账号权限, AMG 不支持 Identity Center 账号实例)。
+# 数据在 AMP; Grafana 只做展示, 通过 SigV4 + IRSA 读 AMP。仅 kubectl port-forward 访问。
+#
+# 前置:
+#   1) eksctl create iamserviceaccount --cluster daft-ray-graviton --namespace monitoring --name grafana \
+#        --attach-policy-arn arn:aws:iam::aws:policy/AmazonPrometheusQueryAccess --approve
+#   2) 镜像/chart 已由 CodeBuild 中转到 ECR (mirror/grafana/grafana:12.3.1, charts/grafana 10.5.15)
+# 渲染变量: ECR_REGISTRY, AMP_WORKSPACE_ID
+
+image:
+  registry: ${ECR_REGISTRY}
+  repository: mirror/grafana/grafana
+  tag: "${GRAFANA_TAG}"   # arm64 镜像用 12.3.1, x86 用 12.3.1-amd64 (由 worker 架构自动选择)
+
+serviceAccount:
+  create: false
+  name: grafana            # 由 eksctl 创建, 绑定 AmazonPrometheusQueryAccess
+
+nodeSelector:
+  role: system
+
+resources:
+  requests: { cpu: 200m, memory: 512Mi }
+  limits:   { memory: 1Gi }
+
+persistence:
+  enabled: false           # 配置全部走 provisioning, 重建不丢
+
+initChownData:
+  enabled: false           # 它的 busybox 镜像在 docker.io, 无持久化卷时不需要
+
+service:
+  type: ClusterIP
+
+grafana.ini:
+  auth:
+    sigv4_auth_enabled: true   # 开源版默认关闭 SigV4; 不开则请求不签名, AMP 返回 403 / Missing Authentication Token
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: AMP
+        type: prometheus
+        access: proxy
+        url: https://aps-workspaces.us-west-2.amazonaws.com/workspaces/${AMP_WORKSPACE_ID}
+        isDefault: true
+        jsonData:
+          httpMethod: POST
+          sigV4Auth: true
+          sigV4AuthType: default
+          sigV4Region: us-west-2
+
+# 自动加载带 grafana_dashboard=1 标签的 ConfigMap 里的面板 (Ray 官方面板 JSON 放进去即可)
+sidecar:
+  image:
+    registry: ${ECR_REGISTRY}
+    repository: quay/kiwigrid/k8s-sidecar
+    tag: "2.5.0"
+  dashboards:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"
+    searchNamespace: monitoring
+  datasources:
+    enabled: false

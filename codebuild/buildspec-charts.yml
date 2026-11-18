@@ -1,0 +1,30 @@
+version: 0.2
+# 把 Helm chart 从公网拉下来, 以 OCI 方式推到私有 ECR (ECR 里的 charts/<name> 仓库需已存在)。
+# 需要环境变量: ECR_REGISTRY, CHARTS (空格分隔的 "名称|chart|版本|仓库URL" 列表; 版本写 latest 表示取最新)
+# 例: "kuberay|kuberay-operator|1.7.1|https://ray-project.github.io/kuberay-helm/"
+phases:
+  install:
+    commands:
+      - curl -fsSL https://get.helm.sh/helm-v3.19.0-linux-arm64.tar.gz | tar -xz -C /tmp
+      - /tmp/linux-arm64/helm version --short
+  build:
+    commands:
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | /tmp/linux-arm64/helm registry login --username AWS --password-stdin "$ECR_REGISTRY"
+      - |
+        for item in $CHARTS; do
+          name=$(echo "$item" | cut -d'|' -f1)
+          chart=$(echo "$item" | cut -d'|' -f2)
+          version=$(echo "$item" | cut -d'|' -f3)
+          url=$(echo "$item" | cut -d'|' -f4)
+          dir=/tmp/charts/$chart
+          mkdir -p "$dir"
+          /tmp/linux-arm64/helm repo add "$name" "$url"
+          /tmp/linux-arm64/helm repo update "$name"
+          if [ "$version" = "latest" ]; then
+            /tmp/linux-arm64/helm pull "$name/$chart" --destination "$dir"
+          else
+            /tmp/linux-arm64/helm pull "$name/$chart" --version "$version" --destination "$dir"
+          fi
+          ls -l "$dir"
+          /tmp/linux-arm64/helm push "$dir"/*.tgz "oci://$ECR_REGISTRY/charts"
+        done

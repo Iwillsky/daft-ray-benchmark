@@ -1,0 +1,86 @@
+# 测试一的 RayCluster (KubeRay): 1 个 head + N 个 worker, 每个 worker 独占一台 4xlarge 节点。
+# 规格推导: 16 vCPU 留 1 个给 kubelet / DaemonSet -> 15 CPU; object store 放 /dev/shm (计入容器内存), Pod 内存 112Gi;
+#           超出 object store 的数据 spill 到 /tmp/ray (EBS 机型 = 根盘, NVMe 机型 = 本地 NVMe RAID0)。
+# head 的 num-cpus 为 0, 不跑任务; head / worker 都用 ray-s3-access ServiceAccount (IRSA) 读写 S3。
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: daft-ray
+  namespace: ray
+spec:
+  rayVersion: "${ray_version}"
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    upscalingMode: Default
+    idleTimeoutSeconds: 600
+
+  headGroupSpec:
+    rayStartParams:
+      num-cpus: "0"
+      dashboard-host: "0.0.0.0"
+      metrics-export-port: "8080"
+    template:
+      metadata:
+        labels:
+          app: ray-head
+      spec:
+        serviceAccountName: ray-s3-access
+        nodeSelector:
+          role: system
+          kubernetes.io/arch: ${arch}
+        containers:
+          - name: ray-head
+            image: ${image}
+            imagePullPolicy: IfNotPresent
+            ports:
+              - { containerPort: 6379,  name: gcs }
+              - { containerPort: 8265,  name: dashboard }
+              - { containerPort: 10001, name: client }
+              - { containerPort: 8080,  name: metrics }
+            resources:
+              requests: { cpu: "${head_cpus}", memory: ${head_mem_gib}Gi }
+              limits:   { cpu: "${head_cpus}", memory: ${head_mem_gib}Gi }
+            env:
+              - { name: DAFT_RUNNER, value: "ray" }
+
+  workerGroupSpecs:
+    - groupName: cpu-workers
+      replicas: ${workers}
+      minReplicas: ${workers}
+      maxReplicas: ${workers}
+      rayStartParams:
+        num-cpus: "${num_cpus}"
+        object-store-memory: "${obj_bytes}"
+        metrics-export-port: "8080"
+      template:
+        metadata:
+          labels:
+            app: ray-worker
+        spec:
+          serviceAccountName: ray-s3-access
+          nodeSelector:
+            role: ray-worker
+            kubernetes.io/arch: ${arch}
+          tolerations:
+            - { key: workload, operator: Equal, value: ray-worker, effect: NoSchedule }
+          containers:
+            - name: ray-worker
+              image: ${image}
+              imagePullPolicy: IfNotPresent
+              ports:
+                - { containerPort: 8080, name: metrics }
+              resources:
+                requests: { cpu: "${num_cpus}", memory: ${worker_mem_gib}Gi }
+                limits:   { cpu: "${num_cpus}", memory: ${worker_mem_gib}Gi }
+              env:
+                - { name: DAFT_RUNNER, value: "ray" }
+              volumeMounts:
+                - { name: ray-tmp, mountPath: /tmp/ray }
+                - { name: dshm,    mountPath: /dev/shm }
+          volumes:
+            - name: ray-tmp
+              emptyDir: {}
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: ${shm_gib}Gi
