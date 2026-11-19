@@ -171,6 +171,7 @@ locals {
 }
 
 resource "aws_launch_template" "worker" {
+  count       = local.elastic ? 0 : 1
   name_prefix = "${var.name}-worker-"
 
   block_device_mappings {
@@ -203,8 +204,9 @@ resource "aws_launch_template" "worker" {
   }
 }
 
-# ---------------------------------------------------------------- worker 节点组 (静态: min = max = desired)
+# ---------------------------------------------------------------- worker 节点组 (仅 static 模式: min = max = desired)
 resource "aws_eks_node_group" "worker" {
+  count           = local.elastic ? 0 : 1
   cluster_name    = aws_eks_cluster.this.name
   node_group_name = "ng-worker"
   node_role_arn   = aws_iam_role.node.arn
@@ -214,8 +216,8 @@ resource "aws_eks_node_group" "worker" {
   capacity_type   = "ON_DEMAND"
 
   launch_template {
-    id      = aws_launch_template.worker.id
-    version = aws_launch_template.worker.latest_version
+    id      = aws_launch_template.worker[0].id
+    version = aws_launch_template.worker[0].latest_version
   }
 
   scaling_config {

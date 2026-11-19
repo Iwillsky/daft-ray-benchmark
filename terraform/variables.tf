@@ -3,8 +3,19 @@
 # ======================================================================================
 
 # ---------------------------------------------------------------- 机型 (主要输入)
+variable "cluster_mode" {
+  description = "static = 测试一 (3 台静态 worker, 无 FSx); elastic = 测试二 (Karpenter 弹性 worker + FSx for Lustre + 独立 head 节点)。"
+  type        = string
+  default     = "static"
+
+  validation {
+    condition     = contains(["static", "elastic"], var.cluster_mode)
+    error_message = "cluster_mode 只能是 static 或 elastic。"
+  }
+}
+
 variable "worker_instance_type" {
-  description = "Ray worker 机型, 例如 r7i.4xlarge / r8a.4xlarge / r8i.4xlarge / r8g.4xlarge / r9g.4xlarge (EBS 机型) 或 r8gd.4xlarge / r8id.4xlarge (带本地 NVMe)。架构 (arm64 / x86_64) 和是否带 NVMe 由 AWS API 自动识别, 并决定镜像、AMI、根盘和 spill 目录。"
+  description = "Ray worker 机型 (elastic 模式下是 Karpenter NodePool 的机型, 例如 r8g.16xlarge), 例如 r7i.4xlarge / r8a.4xlarge / r8i.4xlarge / r8g.4xlarge / r9g.4xlarge (EBS 机型) 或 r8gd.4xlarge / r8id.4xlarge (带本地 NVMe)。架构 (arm64 / x86_64) 和是否带 NVMe 由 AWS API 自动识别, 并决定镜像、AMI、根盘和 spill 目录。"
   type        = string
   default     = "r8g.4xlarge"
 
@@ -15,7 +26,7 @@ variable "worker_instance_type" {
 }
 
 variable "worker_count" {
-  description = "worker 节点数 (静态, 不自动伸缩; 测试一为 3)。"
+  description = "static 模式: worker 节点数 (静态, 不自动伸缩; 测试一为 3)。elastic 模式不使用 (节点数由 Karpenter 随负载伸缩, 上限见 elastic_max_vcpus)。"
   type        = number
   default     = 3
 }
@@ -251,4 +262,45 @@ variable "load_ray_dashboards" {
 variable "tags" {
   type    = map(string)
   default = { project = "daft-ray-static" }
+}
+
+# ---------------------------------------------------------------- 测试二 (elastic) 专用
+variable "head_instance_type" {
+  description = "elastic 模式: Ray head 独占的节点机型 (测试二用 r8g.8xlarge; 多路并发作业时 head 内存峰值约 33 GiB)。"
+  type        = string
+  default     = "r8g.8xlarge"
+}
+
+variable "elastic_max_vcpus" {
+  description = "elastic 模式: Karpenter NodePool 的 vCPU 上限 (测试二 1024 = 16 台 r8g.16xlarge)。EC2 的 On-Demand vCPU 配额要先够。"
+  type        = number
+  default     = 1024
+}
+
+variable "karpenter_version" {
+  type    = string
+  default = "1.15.0"
+}
+
+variable "fsx_storage_gib" {
+  description = "elastic 模式: FSx for Lustre 容量 (GiB), PERSISTENT_2 SSD 必须是 2400 的倍数。测试二原始配置是 81600 (约 $38/小时), 这里默认 4800 以免误开大额费用; 复现测试二的吞吐数字请改成 81600。"
+  type        = number
+  default     = 4800
+
+  validation {
+    condition     = var.fsx_storage_gib % 2400 == 0
+    error_message = "fsx_storage_gib 必须是 2400 的倍数。"
+  }
+}
+
+variable "fsx_throughput_per_tib" {
+  description = "FSx PERSISTENT_2 每 TiB 吞吐 (MB/s): 125 / 250 / 500 / 1000。测试二用 500。"
+  type        = number
+  default     = 500
+}
+
+variable "grafana_anonymous_viewer" {
+  description = "Grafana 开启匿名只读 (Viewer), 让嵌入 iframe 的面板不用再登录。Grafana 只通过 port-forward 访问; 关闭后嵌入页需要用 admin 登录。"
+  type        = bool
+  default     = true
 }

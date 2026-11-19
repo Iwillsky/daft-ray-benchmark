@@ -1,0 +1,105 @@
+# 测试二的 RayCluster (KubeRay + Ray autoscaler + Karpenter): 0~N 个 worker Pod 随负载伸缩, 每台 r8g.16xlarge 放 2 个 (31C / 224Gi)。
+# - head 独占 ng-head 节点 (num-cpus 0, 不跑任务; 多路并发作业的 driver 由 --entrypoint-num-cpus 调度到 worker 上)
+# - object store = worker Pod 内存的一半 (112 GiB), spill 到 FSx (/fsx/spill)
+# - 所有 Pod 挂载 PVC fsx-pvc 到 /fsx; 提交作业时 --root /fsx/<前缀> 从 FSx 读数据
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: daft-ray
+  namespace: ray
+spec:
+  rayVersion: "${ray_version}"
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    upscalingMode: Default
+    idleTimeoutSeconds: 300
+
+  headGroupSpec:
+    rayStartParams:
+      num-cpus: "0"
+      object-store-memory: "8589934592"
+      dashboard-host: "0.0.0.0"
+      metrics-export-port: "8080"
+    template:
+      metadata:
+        labels:
+          app: ray-head
+      spec:
+        serviceAccountName: ray-s3-access
+        nodeSelector:
+          role: ray-head
+          kubernetes.io/arch: ${arch}
+        tolerations:
+          - { key: workload, operator: Equal, value: ray-head, effect: NoSchedule }
+        containers:
+          - name: ray-head
+            image: ${image}
+            imagePullPolicy: IfNotPresent
+            ports:
+              - { containerPort: 6379,  name: gcs }
+              - { containerPort: 8265,  name: dashboard }
+              - { containerPort: 10001, name: client }
+              - { containerPort: 8080,  name: metrics }
+            resources:
+              requests: { cpu: "${head_cpus}", memory: ${head_mem_gib}Gi }
+              limits:   { cpu: "${head_cpus}", memory: ${head_mem_gib}Gi }
+            env:
+              - { name: DAFT_RUNNER, value: "ray" }
+              - name: RAY_object_spilling_config
+                value: '{"type":"filesystem","params":{"directory_path":"/fsx/spill","buffer_size":8388608}}'
+            volumeMounts:
+              - { name: fsx,  mountPath: /fsx }
+              - { name: dshm, mountPath: /dev/shm }
+        volumes:
+          - name: fsx
+            persistentVolumeClaim: { claimName: fsx-pvc }
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 10Gi }
+
+  workerGroupSpecs:
+    - groupName: cpu-workers
+      replicas: 0
+      minReplicas: 0
+      maxReplicas: ${max_replicas}
+      rayStartParams:
+        num-cpus: "${worker_cpus}"
+        object-store-memory: "${obj_bytes}"
+        metrics-export-port: "8080"
+      template:
+        metadata:
+          labels:
+            app: ray-worker
+        spec:
+          serviceAccountName: ray-s3-access
+          nodeSelector:
+            role: ray-worker
+            kubernetes.io/arch: ${arch}
+          tolerations:
+            - { key: workload, operator: Equal, value: ray-worker, effect: NoSchedule }
+          containers:
+            - name: ray-worker
+              image: ${image}
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["SYS_PTRACE"]
+              ports:
+                - { containerPort: 8080, name: metrics }
+              resources:
+                requests: { cpu: "${worker_cpus}", memory: ${worker_mem_gib}Gi }
+                limits:   { cpu: "${worker_cpus}", memory: ${worker_mem_gib}Gi }
+              env:
+                - { name: DAFT_RUNNER, value: "ray" }
+                - name: RAY_object_spilling_config
+                  value: '{"type":"filesystem","params":{"directory_path":"/fsx/spill","buffer_size":8388608}}'
+              volumeMounts:
+                - { name: ray-tmp, mountPath: /tmp/ray }
+                - { name: dshm,    mountPath: /dev/shm }
+                - { name: fsx,     mountPath: /fsx }
+          volumes:
+            - name: ray-tmp
+              emptyDir: {}
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: ${shm_gib}Gi }
+            - name: fsx
+              persistentVolumeClaim: { claimName: fsx-pvc }

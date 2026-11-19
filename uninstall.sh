@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 YES=0; WORKERS_ONLY=0
 for a in "$@"; do case "$a" in --yes|-y) YES=1 ;; --workers-only) WORKERS_ONLY=1 ;; -h|--help) sed -n '2,10p' "$0"; exit 0 ;; *) echo "未知参数 $a"; exit 1 ;; esac; done
 load_config
-VARS="$STATE_DIR/terraform.tfvars"
+VARS="$STATE_DIR/terraform.$CLUSTER_NAME.tfvars"
 [ -f "$VARS" ] || { echo "找不到 $VARS (还没执行过 install.sh 第 6 步?)"; exit 1; }
 if [ "$WORKERS_ONLY" = 1 ]; then
   step_begin "1/1" "worker 缩到 0 (保留系统节点和监控)"
@@ -22,6 +22,17 @@ if [ "$WORKERS_ONLY" = 1 ]; then
 fi
 step_begin "1/1" "销毁集群 $CLUSTER_NAME"
 if [ "$YES" != 1 ]; then printf '  将销毁 EKS 集群 %s 及 VPC / 节点 / AMP workspace (S3 数据和 ECR 镜像保留)。继续? [y/N] ' "$CLUSTER_NAME"; read -r ans; case "$ans" in y|Y|yes) ;; *) echo "已取消"; exit 1 ;; esac; fi
+if [ "${CLUSTER_MODE:-static}" = elastic ]; then
+  # Karpenter 拉起的节点不在 Terraform 状态里, 直接 destroy 会留下孤儿 EC2 (继续计费) 并卡住子网删除。
+  # 先删 RayCluster 和 NodePool, 等 NodeClaim 全部回收。集群已不存在时这些命令会失败, 忽略即可。
+  info "弹性模式: 先回收 Karpenter 节点 (RayCluster / NodePool / NodeClaim)"
+  KC="kubectl --context $CLUSTER_NAME"
+  $KC -n ray delete raycluster --all --wait=true --timeout=300s 2>&1 | sed 's/^/    /' || true
+  $KC delete nodepool --all --wait=true --timeout=300s 2>&1 | sed 's/^/    /' || true
+  $KC delete nodeclaims --all --wait=true --timeout=600s 2>&1 | sed 's/^/    /' || true
+  left="$($KC get nodeclaims --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${left:-0}" = 0 ] || step_fail "仍有 $left 个 NodeClaim 未回收" "先在 EC2 控制台确认带标签 karpenter.sh/nodepool 的实例已终止, 再重跑 ./uninstall.sh"
+fi
 terraform -chdir="$ROOT/terraform" destroy -auto-approve -input=false -no-color -var-file="$VARS" 2>&1 | tee -a "$LOG_FILE" | grep --line-buffered -E 'Destroying\.\.\.|Destruction complete|Error|Destroy complete' | sed 's/^/    /' \
   || step_fail "销毁失败" "常见原因: 节点上的 ENI 尚未释放导致子网 / 安全组删除超时, 等几分钟后重跑 ./uninstall.sh" "详细日志: $LOG_FILE"
 step_ok

@@ -61,13 +61,27 @@ output "cluster" {
     region                = var.region
     kubernetes_version    = var.kubernetes_version
     worker_instance_type  = var.worker_instance_type
-    worker_count          = var.worker_count
+    worker_count          = local.elastic ? "弹性 (Karpenter, 上限 ${var.elastic_max_vcpus} vCPU = ${local.e_max_pods} 个 worker Pod)" : var.worker_count
+    mode                  = var.cluster_mode
     worker_arch           = local.arch_label
     worker_has_local_nvme = local.has_nvme
-    worker_spill_target   = local.has_nvme ? "本地 NVMe RAID0" : "EBS 根盘 (${var.ebs_root_volume_gib} GiB gp3, ${var.ebs_root_iops} IOPS, ${var.ebs_root_throughput} MiB/s)"
+    worker_spill_target   = local.elastic ? "FSx for Lustre (/fsx/spill)" : (local.has_nvme ? "本地 NVMe RAID0" : "EBS 根盘 (${var.ebs_root_volume_gib} GiB gp3, ${var.ebs_root_iops} IOPS, ${var.ebs_root_throughput} MiB/s)")
     system_instance_type  = local.system_type
     ray_image             = local.ray_image
-    object_store_bytes    = var.object_store_bytes
+    object_store_bytes    = local.elastic ? local.e_obj_bytes : var.object_store_bytes
     worker_node_check     = "kubectl --context ${local.kube_context} get nodes -L node.kubernetes.io/instance-type,role"
   }
+}
+
+output "fsx" {
+  description = "elastic 模式: FSx for Lustre 信息 (static 模式为 null)。作业从 FSx 读数据时用 --root /fsx/<前缀>。"
+  value = local.elastic ? {
+    file_system_id = aws_fsx_lustre_file_system.this[0].id
+    dns_name       = aws_fsx_lustre_file_system.this[0].dns_name
+    capacity_gib   = var.fsx_storage_gib
+    mount_path     = "/fsx (head 和所有 worker Pod)"
+    data_root      = "/fsx/${var.data_prefix}"
+    spill_dir      = "/fsx/spill"
+    load_data_cmd  = "scripts/fsx_load_data.sh 100 300 500 1000   # 把 S3 数据复制到 FSx"
+  } : null
 }

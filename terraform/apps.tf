@@ -63,6 +63,7 @@ resource "helm_release" "kube_prometheus_stack" {
     ECR_REGISTRY     = local.ecr_registry
     CLUSTER_NAME     = var.name
     AMP_WORKSPACE_ID = local.amp_workspace_id
+    REGION           = var.region
   })]
   depends_on = [aws_eks_node_group.system, aws_eks_addon.coredns, aws_iam_role_policy_attachment.prometheus_remote_write]
 }
@@ -78,9 +79,11 @@ resource "helm_release" "grafana" {
   wait       = true
 
   values = [templatefile("${path.module}/templates/grafana-values.yaml.tftpl", {
-    ECR_REGISTRY     = local.ecr_registry
-    AMP_WORKSPACE_ID = local.amp_workspace_id
-    GRAFANA_TAG      = local.grafana_tag
+    ECR_REGISTRY      = local.ecr_registry
+    AMP_WORKSPACE_ID  = local.amp_workspace_id
+    GRAFANA_TAG       = local.grafana_tag
+    REGION            = var.region
+    GRAFANA_ANONYMOUS = tostring(var.grafana_anonymous_viewer)
   })]
   depends_on = [kubernetes_service_account.grafana, aws_iam_role_policy_attachment.grafana_amp_query, aws_eks_addon.coredns]
 }
@@ -93,7 +96,18 @@ resource "kubectl_manifest" "ray_podmonitor" {
 
 # ---------------------------------------------------------------- RayCluster (测试一: 3 个 worker, 每台一个 Pod)
 resource "kubectl_manifest" "ray_cluster" {
-  yaml_body = templatefile("${path.module}/templates/raycluster.yaml.tftpl", {
+  yaml_body = local.elastic ? templatefile("${path.module}/templates/raycluster-elastic.yaml.tftpl", {
+    ray_version    = var.ray_version
+    image          = local.ray_image
+    arch           = local.arch_label
+    head_cpus      = var.elastic_head_cpus
+    head_mem_gib   = var.elastic_head_memory_gib
+    worker_cpus    = local.e_pod_cpus
+    worker_mem_gib = local.e_pod_mem
+    obj_bytes      = local.e_obj_bytes
+    shm_gib        = local.e_shm_gib
+    max_replicas   = local.e_max_pods
+    }) : templatefile("${path.module}/templates/raycluster.yaml.tftpl", {
     ray_version    = var.ray_version
     image          = local.ray_image
     arch           = local.arch_label
@@ -110,6 +124,9 @@ resource "kubectl_manifest" "ray_cluster" {
     helm_release.kuberay_operator,
     kubernetes_service_account.ray_s3_access,
     aws_eks_node_group.worker,
+    aws_eks_node_group.head,
+    kubectl_manifest.nodepool,
+    kubernetes_job_v1.fsx_init,
     aws_iam_role_policy_attachment.ray_s3,
   ]
 }

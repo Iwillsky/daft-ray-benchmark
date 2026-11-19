@@ -54,6 +54,9 @@ load_config() {
   DATA_PREFIX="${DATA_PREFIX:-tpch-v2}"
   ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
   export ACCOUNT_ID INPUT_BUCKET OUTPUT_BUCKET DATA_PREFIX ECR_REGISTRY
+  # 每个集群名一个 Terraform workspace (状态在 terraform/terraform.tfstate.d/<集群名>/), 测试一和测试二的集群可以同时存在
+  CLUSTER_NAME="${CLUSTER_NAME:-daft-ray-static}"
+  export TF_WORKSPACE="$CLUSTER_NAME"
 }
 
 # 由机型推导架构: arm64 / x86_64 (读 EC2 API)

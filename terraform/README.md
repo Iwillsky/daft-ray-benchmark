@@ -1,7 +1,11 @@
-# 测试一三节点静态集群 Terraform 模板
+# Terraform 模板 (测试一 static / 测试二 elastic)
 
-把测试一 (3 台 4xlarge 的静态 EKS 集群 + KubeRay + Daft on Ray + Prometheus/AMP + Grafana) 的搭建过程写成 Terraform。
-**机型是输入参数** (`worker_instance_type`): 架构 (arm64 / x86_64) 和是否带本地 NVMe 由 AWS API 自动识别, 并据此选择镜像、AMI、根盘、spill 目录和系统节点机型。
+一个 Terraform 根, 用 `cluster_mode` 选择两种集群 (EKS + KubeRay + Daft on Ray + Prometheus/AMP + Grafana):
+
+- `static` (测试一): 3 台固定 worker 节点组。
+- `elastic` (测试二): 固定 1 台 head 节点, worker 由 Karpenter 按需拉起, 数据和 spill 在 FSx for Lustre (`elastic.tf`)。
+
+**机型是输入参数** (`worker_instance_type`; static 时是节点组机型, elastic 时是 Karpenter NodePool 的机型): 架构 (arm64 / x86_64) 和是否带本地 NVMe 由 AWS API 自动识别, 并据此选择镜像、AMI、根盘、spill 目录和系统节点机型。
 
 ## 用法
 
@@ -15,10 +19,11 @@ terraform output                                      # 全部输出参数
 terraform destroy                                     # 测完务必销毁 (见"成本")
 ```
 
-换机型做对比测试时, 每个机型用不同的 `name` (集群名) 各建一套, 可以并行:
+同时存在多个集群 (换机型对比, 或测试一 + 测试二) 时, 每个集群用独立的 workspace 和不同的 `name`。`install.sh` / `uninstall.sh` / `scripts/*.sh` 自动用 `export TF_WORKSPACE=<CLUSTER_NAME>`, 手工操作时也这样做:
 
 ```bash
-terraform workspace new r8g && terraform apply -var name=daft-ray-r8g -var worker_instance_type=r8g.4xlarge
+export TF_WORKSPACE=daft-ray-r8g   # 不存在时 terraform init 会创建
+terraform init && terraform apply -var name=daft-ray-r8g -var worker_instance_type=r8g.4xlarge
 ```
 
 ## 输入参数 (variables.tf)
@@ -35,6 +40,14 @@ terraform workspace new r8g && terraform apply -var name=daft-ray-r8g -var worke
 | `create_vpc_endpoints` | true | 见"账号网络限制" |
 | `region` / `availability_zones` | us-west-2 / [2b, 2c] | 节点只放第一个 AZ |
 | `aws_profile` | null | 用于 kubectl 取 token 和输出里的登录命令 |
+| **`cluster_mode`** | `static` | `static` 或 `elastic` |
+| `head_instance_type` | `r8g.8xlarge` | elastic: Ray head 专用节点组 `ng-head` (固定 1 台) |
+| `elastic_max_vcpus` | 1024 | elastic: NodePool 的 vCPU 上限, 也决定 RayCluster 的 `maxReplicas` |
+| `elastic_head_cpus` / `elastic_head_memory_gib` | 16 / 192 | elastic: head Pod 的 CPU / 内存 |
+| `karpenter_version` | `1.15.0` | elastic: Karpenter chart 版本 (EKS Pod Identity, 无 SQS 中断队列, 仅 On-Demand) |
+| `fsx_storage_gib` | 4800 | elastic: FSx 容量, 2400 的倍数 (原测试 81600 ≈ $38/小时) |
+| `fsx_throughput_per_tib` | 500 | elastic: PERSISTENT_2 吞吐 (MB/s/TiB) |
+| `grafana_anonymous_viewer` | true | Grafana 允许被 iframe 嵌入 (`allow_embedding`, `cookie_samesite=lax`) 并开启匿名 Viewer; 设 false 则只允许登录访问 |
 
 ## 输出参数 (outputs.tf)
 
@@ -45,7 +58,8 @@ terraform workspace new r8g && terraform apply -var name=daft-ray-r8g -var worke
 | `grafana_dashboard` | URL `http://localhost:3000` + port-forward 命令 + 管理员密码获取命令 + AMP workspace |
 | `data_sample_s3` | 输入数据 `s3://<输入桶>/tpch-v2/sf<N>/`、参考结果、测试结果位置 |
 | `logs` | Ray 日志目录 (`/tmp/ray/session_latest/logs`)、作业 driver 日志、raylet 日志、读取命令、S3 结果、AMP 指标库 |
-| `cluster` | 机型 / 架构 / 是否 NVMe / spill 目标 / 镜像 / object store 概况 |
+| `cluster` | 机型 / 架构 / 模式 / 是否 NVMe / spill 目标 / 镜像 / object store 概况 |
+| `fsx` | elastic: FSx 文件系统 ID / DNS / 挂载名 / 容量 (static 为 null) |
 
 > Ray 和 Grafana 的 Dashboard **没有对外暴露** (和测试时一样只开 ClusterIP), 所以 "URL" 是 `localhost` 加一条 port-forward 命令。
 
@@ -58,6 +72,7 @@ terraform workspace new r8g && terraform apply -var name=daft-ray-r8g -var worke
 | `irsa.tf` | 三个 IRSA 角色: `ray-s3-access` (输入桶只读 / 输出桶读写 + AMP 查询)、`amp-prometheus` (remote write)、`grafana` (AMP 查询) |
 | `apps.tf` | 命名空间 `ray` / `monitoring`, KubeRay operator 1.7.1, kube-prometheus-stack 92.10.1 (只采集, remote write 到 AMP), Grafana 10.5.15 (数据源 AMP), Ray PodMonitor, **RayCluster** (`templates/raycluster.yaml.tftpl`: 1 head + N worker, 每台 15 CPU / 112Gi, object store + `/dev/shm`), Ray 官方面板载入 Grafana |
 | `main.tf` | AMP workspace, (可选) S3 桶和 ECR pull-through cache 规则, 机型推导 |
+| `elastic.tf` | 仅 `cluster_mode=elastic`: head 节点组, Pod Identity agent, Karpenter (helm + 节点角色 / instance profile / access entry + controller 角色), NodePool + EC2NodeClass (`templates/karpenter-nodepool.yaml.tftpl`), FSx for Lustre + 安全组 + CSI 驱动 + PV / PVC, 初始化 `/fsx/spill` 的 Job。弹性 RayCluster 在 `apps.tf` 里按模式选模板 (`templates/raycluster-elastic.yaml.tftpl`) |
 
 ## 前置条件 (模板不创建, 由仓库根目录的 install.sh 第 2~5 步准备)
 
@@ -84,9 +99,8 @@ $(terraform output -raw eks_login_command)
 
 3 × worker (r8g.4xlarge ≈ $1.06/h 含 EBS) + 2 × 系统节点 (m8g.2xlarge) + EKS 控制面 $0.10/h + NAT + 8 个 Interface Endpoint (约 $0.08/h) + AMP 按量。三节点集群整体约 $4~5/小时。**不用时 `terraform destroy`**, 或把 `worker_count` 设为 0 再 apply (保留系统节点、NAT、Endpoint 和监控, 约 $1/小时)。
 
-## 校验状态
+## 验证范围
 
-`terraform validate` 通过, `terraform plan` 在 r8g / r7i / r8gd 三种机型上都能生成计划 (58 个资源; 架构、镜像后缀、系统节点机型、NVMe 识别均符合预期)。
-**没有执行过 `apply`** (会创建真实的 EKS 集群和计费资源)。首次 apply 时需要注意:
-- 该模板按 `eksctl + 脚本` 的实际步骤翻译而来, 但 helm OCI 登录、`kubectl_manifest` 对 KubeRay / Prometheus CRD 的时序 (已用 `depends_on` 约束) 只能在真实环境确认;
-- 同一 Terraform 内同时创建集群和 kubernetes / helm provider 是常见做法, 但首次 apply 如遇 provider 认证失败, 先 `terraform apply -target=aws_eks_node_group.system` 再整体 apply。
+`terraform fmt` 和 `validate` 通过; `plan` 在测试一 (r8g / r7i / r8gd 三种机型, 58 个资源) 和测试二 (r8g.16xlarge, 76 个资源) 上都能生成计划, 架构、镜像后缀、系统节点机型、NVMe 识别符合预期。
+`apply` 会创建真实的 EKS 集群和计费资源, 由 `../install.sh` 分两阶段执行: 先建 VPC / EKS / 节点组 / coredns, 再装集群内组件 (KubeRay、Prometheus、Grafana、RayCluster 等), 以保证 kubernetes / helm provider 认证时集群已存在。
+单独使用本模板时如果 provider 认证失败, 先 `terraform apply -target=aws_eks_node_group.system`, 再整体 apply。

@@ -27,7 +27,7 @@ resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.this.id
   availability_zone = var.availability_zones[count.index]
   cidr_block        = cidrsubnet(var.vpc_cidr, 3, count.index + 2)
-  tags              = merge(local.tags, { Name = "${var.name}-private-${count.index}", "kubernetes.io/role/internal-elb" = "1" })
+  tags              = merge(local.tags, { Name = "${var.name}-private-${count.index}", "kubernetes.io/role/internal-elb" = "1", "karpenter.sh/discovery" = var.name })
 }
 
 resource "aws_eip" "nat" {

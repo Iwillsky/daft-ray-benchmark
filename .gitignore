@@ -13,3 +13,7 @@ terraform/crash.log
 __pycache__/
 *.pyc
 .DS_Store
+terraform/terraform.tfstate.d/
+# 配置 (含账号信息)
+config.*.env
+!config.*.env.example

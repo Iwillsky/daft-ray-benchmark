@@ -34,7 +34,15 @@ service:
 
 grafana.ini:
   auth:
-    sigv4_auth_enabled: true   # 开源版默认关闭 SigV4; 不开则请求不签名, AMP 返回 403 / Missing Authentication Token
+    sigv4_auth_enabled: true
+  # 允许被 iframe 嵌入 (默认 X-Frame-Options: deny); Grafana 只通过 port-forward 访问, 不对外暴露
+  security:
+    allow_embedding: true
+    cookie_samesite: lax
+  # 匿名只读 (Viewer): 嵌入的页面不用再登录; 管理员账号 admin 仍然有密码 (secret grafana)。需要关闭时 terraform 变量 grafana_anonymous_viewer = false
+  auth.anonymous:
+    enabled: ${GRAFANA_ANONYMOUS}
+    org_role: Viewer   # 开源版默认关闭 SigV4; 不开则请求不签名, AMP 返回 403 / Missing Authentication Token
 
 datasources:
   datasources.yaml:
@@ -43,13 +51,13 @@ datasources:
       - name: AMP
         type: prometheus
         access: proxy
-        url: https://aps-workspaces.us-west-2.amazonaws.com/workspaces/${AMP_WORKSPACE_ID}
+        url: https://aps-workspaces.${REGION}.amazonaws.com/workspaces/${AMP_WORKSPACE_ID}
         isDefault: true
         jsonData:
           httpMethod: POST
           sigV4Auth: true
           sigV4AuthType: default
-          sigV4Region: us-west-2
+          sigV4Region: ${REGION}
 
 # 自动加载带 grafana_dashboard=1 标签的 ConfigMap 里的面板 (Ray 官方面板 JSON 放进去即可)
 sidecar:

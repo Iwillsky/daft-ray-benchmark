@@ -13,7 +13,7 @@ locals {
   has_nvme        = data.aws_ec2_instance_type.worker.instance_storage_supported
   arch_label      = local.is_arm ? "arm64" : "amd64"
   worker_ami_type = local.is_arm ? "AL2023_ARM_64_STANDARD" : "AL2023_x86_64_STANDARD"
-  system_type     = coalesce(var.system_instance_type, local.is_arm ? "m8g.2xlarge" : "m8i.2xlarge")
+  system_type     = coalesce(var.system_instance_type, local.is_arm ? (local.elastic ? "m8g.4xlarge" : "m8g.2xlarge") : (local.elastic ? "m8i.4xlarge" : "m8i.2xlarge"))
 
   # ---- 镜像
   ecr_registry = coalesce(var.ecr_registry, "${local.account_id}.dkr.ecr.${var.region}.amazonaws.com")

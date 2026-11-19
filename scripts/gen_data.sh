@@ -2,12 +2,12 @@
 # 步骤: 在 CodeBuild 里用 DuckDB 的 tpch 扩展生成 TPC-H Parquet 数据集并写到 s3://<输入桶>/<前缀>/sf<N>/ (见 codebuild/tpch_gen.py)。
 # 在 CodeBuild 做是因为 DuckDB 扩展要联网下载, 集群节点访问不了公网。已有且校验通过的规模会跳过。
 # 用法: scripts/gen_data.sh <SF> [--force]        例: scripts/gen_data.sh 100
-# 每张大表拆成 CHILDREN 个文件 (对齐 Daft 官方 benchmark: SF100=32, SF1000=512; SF3000=1536 来自测试一的实际数据)。
+# 每张大表拆成 CHILDREN 个文件 (对齐 Daft 官方 benchmark: SF100=32, SF1000=512; SF3000=1536)。
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 load_config
 SF="${1:?用法: gen_data.sh <SF> [--force]}"; FORCE="${2:-}"
-# 规模 -> CHILDREN PROCS 计算规格 超时(分钟) ; 其中 1 / 100 / 1000 / 3000 来自测试一的实际运行, 300 / 500 为按同一规则的取值
+# 规模 -> CHILDREN PROCS 计算规格 超时(分钟) ; 300 / 500 的文件数介于 100 (32) 和 1000 (512) 之间
 case "$SF" in
   1)    CHILDREN=8;    PROCS=4;  COMPUTE=BUILD_GENERAL1_LARGE;  TMO=60  ;;
   100)  CHILDREN=32;   PROCS=8;  COMPUTE=BUILD_GENERAL1_XLARGE; TMO=180 ;;

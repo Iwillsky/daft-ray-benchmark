@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # 一键部署: 生成数据 -> 上传 ECR 镜像 -> 创建 EKS 集群 -> 安装 Helm chart (KubeRay / Prometheus / Grafana) -> 起 Ray 集群并验证。
+# 两种集群 (config.env 里 CLUSTER_MODE):
+#   static   测试一: 3 台静态 worker (EBS 或本地 NVMe), 数据直接读 S3
+#   elastic  测试二: Karpenter 弹性 worker (r8g.16xlarge, 至多 1024 vCPU) + FSx for Lustre (spill 和数据), 独立 head 节点
 # 每一步都幂等 (已存在就跳过), 中途失败修好问题后直接重跑即可, 也可以 --from <步骤号> 从某一步继续。
 #
 #   ./install.sh                    全流程 (先显示计划并确认)
@@ -8,7 +11,7 @@
 #   ./install.sh --from 6          从第 6 步开始 (前面步骤视为已完成)
 #   ./install.sh --only 5          只做第 5 步
 #   ./install.sh --skip 5          跳过某些步骤 (逗号分隔, 例: --skip 5 跳过数据生成)
-#   ./install.sh --config my.env   使用其它配置文件 (默认 config.env)
+#   ./install.sh --config my.env   使用其它配置文件 (默认 config.env; 测试二用 config.test2.env.example 改出来的文件)
 #
 # 步骤:
 #   1 预检         工具 / 凭证 / 机型和可用区
@@ -18,11 +21,12 @@
 #   5 TPC-H 数据与参考结果   CodeBuild 生成到 S3 (scripts/gen_data.sh, gen_reference.sh)
 #   6 EKS 集群与节点  Terraform: VPC / Endpoint / EKS / 系统节点 / worker 节点
 #   7 集群内组件      Terraform: KubeRay、Prometheus->AMP、Grafana、RayCluster
-#   8 验证           等 Ray 就绪, 同步作业脚本, 跑冒烟作业, 打印访问方式
+#   8 FSx 数据       (仅 elastic) 把 S3 数据复制到 FSx (scripts/fsx_load_data.sh)
+#   9 验证           等 Ray 就绪, 同步作业脚本, 跑冒烟作业, 打印访问方式
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$ROOT/scripts/lib.sh"
-TOTAL=8
+TOTAL=9
 YES=0; DRY=0; FROM=1; ONLY=""; SKIP=","
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,7 +36,7 @@ while [ $# -gt 0 ]; do
     --only) ONLY="$2"; shift 2 ;;
     --skip) SKIP=",$2,"; shift 2 ;;
     --config) export CONFIG_FILE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "未知参数: $1 (见 --help)"; exit 1 ;;
   esac
 done
@@ -62,14 +66,16 @@ if [ "$DRY" = 1 ]; then
 else
   load_config
 fi
+CLUSTER_MODE="${CLUSTER_MODE:-static}"
 WORKER_INSTANCE_TYPE="${WORKER_INSTANCE_TYPE:-r8g.4xlarge}"; CLUSTER_NAME="${CLUSTER_NAME:-daft-ray-static}"; WORKER_COUNT="${WORKER_COUNT:-3}"
+HEAD_INSTANCE_TYPE="${HEAD_INSTANCE_TYPE:-r8g.8xlarge}"; ELASTIC_MAX_VCPUS="${ELASTIC_MAX_VCPUS:-1024}"; FSX_STORAGE_GIB="${FSX_STORAGE_GIB:-4800}"; KARPENTER_VERSION="${KARPENTER_VERSION:-1.15.0}"
 DATA_SCALE_FACTORS="${DATA_SCALE_FACTORS:-1 100}"; GENERATE_REFERENCE="${GENERATE_REFERENCE:-true}"
-TFDIR="$ROOT/terraform"; TFVARS="$STATE_DIR/terraform.tfvars"
+TFDIR="$ROOT/terraform"; TFVARS="$STATE_DIR/terraform.$CLUSTER_NAME.tfvars"
 
 printf '%s\n' "${C_BLD}Daft on Ray / EKS 一键部署${C_RST}"
 cat <<EOF
   账号 / 区域   : $ACCOUNT_ID / $AWS_REGION   (AZ: $AZ1 [节点], $AZ2 [仅控制面])
-  集群          : $CLUSTER_NAME   机型 ${WORKER_INSTANCE_TYPE} x $WORKER_COUNT
+  集群          : $CLUSTER_NAME   模式 $CLUSTER_MODE   机型 ${WORKER_INSTANCE_TYPE}$([ "$CLUSTER_MODE" = elastic ] && echo " (Karpenter, 上限 $ELASTIC_MAX_VCPUS vCPU; head $HEAD_INSTANCE_TYPE; FSx ${FSX_STORAGE_GIB} GiB)" || echo " x $WORKER_COUNT")
   S3            : s3://$INPUT_BUCKET/$DATA_PREFIX  (数据)   s3://$OUTPUT_BUCKET/$DATA_PREFIX  (结果)
   数据规模      : SF $DATA_SCALE_FACTORS   参考结果: $GENERATE_REFERENCE
   ECR           : $ECR_REGISTRY
@@ -79,14 +85,15 @@ if [ "$DRY" = 1 ]; then
   cat <<EOF
 
 ${C_YEL}--dry-run: 只列出各步骤要做的事, 不调用 AWS${C_RST}
-  [1/8] 预检         检查 aws / terraform / kubectl / python3 / zip, 凭证, 机型 $WORKER_INSTANCE_TYPE 在 $AZ1 的供货
-  [2/8] 前置资源     bootstrap.sh: S3 桶 x2, ECR 仓库 x5, Pull-through Cache x3, IAM 角色 daft-ray-codebuild, CodeBuild 项目 x2
-  [3/8] 镜像         build_image.sh <由机型决定的架构>: CodeBuild 构建 daft-ray:$IMAGE_TAG[-x86_64]
-  [4/8] 中转         mirror.sh: charts/{kuberay-operator $KUBERAY_CHART_VERSION, kube-prometheus-stack $KPS_CHART_VERSION, grafana $GRAFANA_CHART_VERSION}, mirror/grafana/grafana:$GRAFANA_IMAGE_VERSION
-  [5/8] 数据         gen_data.sh / gen_reference.sh: SF $DATA_SCALE_FACTORS
-  [6/8] 集群         terraform apply (目标: VPC / Endpoint / EKS / 系统节点 / worker 节点 / coredns)
-  [7/8] 组件         terraform apply (KubeRay operator / kube-prometheus-stack / Grafana / PodMonitor / RayCluster / Ray 面板)
-  [8/8] 验证         等 Ray head 和 $WORKER_COUNT 个 worker Ready, 同步 job/, 跑 SF1 冒烟作业, 打印 terraform output
+  [1/9] 预检         检查 aws / terraform / kubectl / python3 / zip, 凭证, 机型 $WORKER_INSTANCE_TYPE 在 $AZ1 的供货
+  [2/9] 前置资源     bootstrap.sh: S3 桶 x2, ECR 仓库 x5, Pull-through Cache x3, IAM 角色 daft-ray-codebuild, CodeBuild 项目 x2
+  [3/9] 镜像         build_image.sh <由机型决定的架构>: CodeBuild 构建 daft-ray:$IMAGE_TAG[-x86_64]
+  [4/9] 中转         mirror.sh: charts/{kuberay-operator $KUBERAY_CHART_VERSION, kube-prometheus-stack $KPS_CHART_VERSION, grafana $GRAFANA_CHART_VERSION}, mirror/grafana/grafana:$GRAFANA_IMAGE_VERSION
+  [5/9] 数据         gen_data.sh / gen_reference.sh: SF $DATA_SCALE_FACTORS
+  [6/9] 集群         terraform apply (目标: VPC / Endpoint / EKS / 系统节点$([ "$CLUSTER_MODE" = elastic ] && echo " / head 节点" || echo " / worker 节点") / coredns)
+  [7/9] 组件         terraform apply ($([ "$CLUSTER_MODE" = elastic ] && echo "Karpenter + NodePool / FSx + CSI + PV/PVC / " )KubeRay operator / kube-prometheus-stack / Grafana / PodMonitor / RayCluster / Ray 面板)
+  [8/9] FSx 数据     $([ "$CLUSTER_MODE" = elastic ] && echo "fsx_load_data.sh: 把 SF $DATA_SCALE_FACTORS 从 S3 复制到 FSx" || echo "(static 模式不需要, 跳过)")
+  [9/9] 验证         等 Ray head$([ "$CLUSTER_MODE" = elastic ] || echo " 和 $WORKER_COUNT 个 worker") Ready, 同步 job/, 跑 SF1 冒烟作业, 打印 terraform output
 EOF
   exit 0
 fi
@@ -107,7 +114,7 @@ if should_run 1; then
   info "$AZ1 有 $WORKER_INSTANCE_TYPE 供货"
   step_ok
   if [ "$YES" != 1 ]; then
-    printf '\n  将创建的主要计费资源: %s 台 %s + 2 台系统节点 + EKS 控制面 + NAT + VPC Endpoint + AMP, 约 $4~5/小时; CodeBuild 和数据生成另计。\n  继续? [y/N] ' "$WORKER_COUNT" "$WORKER_INSTANCE_TYPE"
+    printf '\n  将创建的主要计费资源: %s 台 %s (elastic 模式为按需弹性) + 系统节点 + EKS 控制面 + NAT + VPC Endpoint + AMP%s; CodeBuild 和数据生成另计。\n  继续? [y/N] ' "$WORKER_COUNT" "$WORKER_INSTANCE_TYPE" "$([ "$CLUSTER_MODE" = elastic ] && echo " + head 节点 + FSx ${FSX_STORAGE_GIB} GiB (约 \$0.47/小时/TiB)")"
     read -r ans; case "$ans" in y|Y|yes) ;; *) echo "已取消"; exit 1 ;; esac
   fi
 fi
@@ -152,6 +159,11 @@ fi
 write_tfvars() {
   local sfs; sfs="$(echo "$DATA_SCALE_FACTORS" | sed 's/ \+/, /g')"
   {
+    echo "cluster_mode         = \"$CLUSTER_MODE\""
+    echo "head_instance_type   = \"$HEAD_INSTANCE_TYPE\""
+    echo "elastic_max_vcpus    = $ELASTIC_MAX_VCPUS"
+    echo "fsx_storage_gib      = $FSX_STORAGE_GIB"
+    echo "karpenter_version    = \"$KARPENTER_VERSION\""
     echo "region               = \"$AWS_REGION\""
     echo "name                 = \"$CLUSTER_NAME\""
     echo "worker_instance_type = \"$WORKER_INSTANCE_TYPE\""
@@ -184,26 +196,39 @@ tf_apply() { # 额外参数 (-target=...)
 
 # ---------------------------------------------------------------- 6 集群
 if should_run 6; then
-  step_begin "6/$TOTAL" "Terraform: VPC / EKS 集群 / 系统节点 / worker 节点 (约 15~20 分钟)"
+  step_begin "6/$TOTAL" "Terraform: VPC / EKS 集群 / 系统节点 / $([ "$CLUSTER_MODE" = elastic ] && echo head || echo worker) 节点 (约 15~20 分钟)"
   write_tfvars
   run_script terraform -chdir="$TFDIR" init -input=false -no-color -upgrade=false >/dev/null || step_fail "terraform init 失败" "检查网络能否访问 registry.terraform.io"
   info "分阶段创建: 先只建网络、EKS、节点和 coredns, 节点就绪后第 7 步再装集群内组件 (这样 kubernetes / helm provider 一定拿得到集群)"
-  tf_apply -target=aws_eks_node_group.system -target=aws_eks_node_group.worker -target=aws_eks_addon.coredns -target=aws_eks_addon.kube_proxy \
+  tf_apply -target=aws_eks_node_group.system -target=aws_eks_node_group.worker -target=aws_eks_node_group.head -target=aws_eks_addon.coredns -target=aws_eks_addon.kube_proxy \
     || step_fail "创建 EKS / 节点失败" "节点组一直 CREATING: 检查 VPC Endpoint 是否建成 (create_vpc_endpoints)、机型在 $AZ1 是否有容量" "修复后重跑 ./install.sh --from 6 (terraform 会接着做)"
   step_ok
 fi
 
 # ---------------------------------------------------------------- 7 组件
 if should_run 7; then
-  step_begin "7/$TOTAL" "Terraform: KubeRay / Prometheus / Grafana / RayCluster (约 10 分钟)"
+  step_begin "7/$TOTAL" "Terraform: $([ "$CLUSTER_MODE" = elastic ] && echo "Karpenter / FSx (约 15 分钟) / ")KubeRay / Prometheus / Grafana / RayCluster (约 10 分钟)"
   [ -f "$TFVARS" ] || write_tfvars
   tf_apply || step_fail "安装集群内组件失败" "helm 拉不到 chart: 确认第 4 步已完成 (ECR 里有 charts/*), 节点能经 Pull-through Cache 拉镜像" "查看详细错误: $LOG_FILE" "修复后重跑 ./install.sh --from 7"
   step_ok
 fi
 
-# ---------------------------------------------------------------- 8 验证
+# ---------------------------------------------------------------- 8 FSx 数据
 if should_run 8; then
-  step_begin "8/$TOTAL" "验证: Ray 集群就绪、同步作业脚本、冒烟作业"
+  step_begin "8/$TOTAL" "FSx 数据: 把 S3 数据复制到 FSx for Lustre"
+  if [ "$CLUSTER_MODE" != elastic ]; then
+    step_skip "static 模式没有 FSx"
+  else
+    eval "$(terraform -chdir="$TFDIR" output -raw eks_login_command 2>/dev/null)" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    run_script "$ROOT/scripts/fsx_load_data.sh" $DATA_SCALE_FACTORS || step_fail "FSx 数据复制失败" "kubectl --context $CLUSTER_NAME -n ray get pods -l job-name=copy-tpch-to-fsx" "Karpenter 没拉起节点: kubectl --context $CLUSTER_NAME logs -n kube-system deploy/karpenter --tail=50"
+    step_ok
+  fi
+fi
+
+# ---------------------------------------------------------------- 9 验证
+if should_run 9; then
+  step_begin "9/$TOTAL" "验证: Ray 集群就绪、同步作业脚本、冒烟作业"
   LOGIN="$(terraform -chdir="$TFDIR" output -raw eks_login_command 2>/dev/null)" || step_fail "读不到 terraform 输出" "先完成第 6、7 步"
   eval "$LOGIN" >/dev/null
   info "kubeconfig 已写入 (context $CLUSTER_NAME)"
@@ -212,7 +237,9 @@ if should_run 8; then
   $K -n ray wait --for=condition=Ready pod -l ray.io/node-type=head --timeout=900s >/dev/null 2>&1 || step_fail "Ray head 15 分钟内没有 Ready" "kubectl --context $CLUSTER_NAME -n ray describe pod -l ray.io/node-type=head" "镜像拉取失败: 确认 ECR 里有 daft-ray:$IMAGE_TAG"
   info "Ray head Ready"
   n=0
+  if [ "$CLUSTER_MODE" = elastic ]; then WORKER_COUNT=0; info "elastic 模式: worker 由 Karpenter 随作业拉起, 现在是 0 个"; fi
   for _ in $(seq 1 90); do
+    [ "$WORKER_COUNT" -eq 0 ] && break
     n=$($K -n ray get pods -l ray.io/node-type=worker --no-headers 2>/dev/null | awk '$2=="1/1" && $3=="Running"' | wc -l | tr -d ' ')
     [ "$n" -ge "$WORKER_COUNT" ] && break; sleep 10
   done
@@ -221,7 +248,7 @@ if should_run 8; then
   "$ROOT/scripts/sync_job.sh" "$CLUSTER_NAME" >/dev/null && info "job/ 已同步到 head:/tmp/job"
   case " $DATA_SCALE_FACTORS " in
     *" 1 "*) info "冒烟作业: SF1 Q1-Q3 (对照官方标准答案)"
-             run_script "$ROOT/scripts/run_benchmark.sh" --sf 1 --questions 1-3 -- --no-warmup || step_fail "冒烟作业失败" "kubectl --context $CLUSTER_NAME -n ray logs -l ray.io/node-type=head -c ray-head --tail=100" ;;
+             run_script "$ROOT/scripts/run_benchmark.sh" --sf 1 --questions 1-3 --source "$([ "$CLUSTER_MODE" = elastic ] && echo fsx || echo s3)" -- --no-warmup || step_fail "冒烟作业失败" "kubectl --context $CLUSTER_NAME -n ray logs -l ray.io/node-type=head -c ray-head --tail=100" ;;
     *) info "DATA_SCALE_FACTORS 里没有 1, 跳过冒烟作业 (手动: scripts/run_benchmark.sh --sf <SF>)" ;;
   esac
   step_ok

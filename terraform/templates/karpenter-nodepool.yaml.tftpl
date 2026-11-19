@@ -1,0 +1,60 @@
+# 测试二的 Karpenter NodePool + EC2NodeClass: 只用 On-Demand、只放一个 AZ、只用一种机型; 空节点 5 分钟后回收。
+# vCPU 上限 = 机型 vCPU x 台数 (测试二: 1024 = 16 台 r8g.16xlarge)。
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: ${name}
+spec:
+  template:
+    metadata:
+      labels:
+        role: ray-worker
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: ${name}
+      taints:
+        - { key: workload, value: ray-worker, effect: NoSchedule }
+      requirements:
+        - { key: kubernetes.io/arch, operator: In, values: ["${arch}"] }
+        - { key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"] }
+        - { key: node.kubernetes.io/instance-type, operator: In, values: ["${instance_type}"] }
+        - { key: topology.kubernetes.io/zone, operator: In, values: ["${zone}"] }
+      expireAfter: Never
+  limits:
+    cpu: "${max_vcpus}"
+    memory: ${max_memory_gib}Gi
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: ${name}
+spec:
+  instanceProfile: ${instance_profile}
+  amiSelectorTerms:
+    - alias: al2023@latest
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Name: "*private*"
+  securityGroupSelectorTerms:
+    - tags:
+        aws:eks:cluster-name: ${cluster_name}
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        iops: 3000
+        throughput: 125
+        encrypted: true
+        deleteOnTermination: true
+  metadataOptions:
+    httpEndpoint: enabled
+    httpPutResponseHopLimit: 2
+    httpTokens: required
+  tags: ${tags}

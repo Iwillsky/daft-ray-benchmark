@@ -265,7 +265,7 @@ def main():
             s3_put(f"{run_dir}/RESULTS.md", md)
             print(f"RESULT_MD {run_dir}/RESULTS.md", flush=True)
         except Exception as e:
-            print(f"REPORT_FAILED {type(e).__name__}: {str(e)[:300]} (可以稍后用 scripts/make_report.py 补生成)", flush=True)
+            print(f"REPORT_FAILED {type(e).__name__}: {str(e)[:300]} (summary.json 已写入, 指标报告失败不影响作业结果)", flush=True)
 
     if cnt["FAIL"] or cnt["ERROR"]:
         sys.exit(1)
